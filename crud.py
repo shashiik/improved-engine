@@ -123,7 +123,8 @@ class ReadObject(object):
                  column_objects=None,
                  list_column_objects=None,
                  allow_bulk_update=False,
-                 extended_bulk_errors=False):
+                 extended_bulk_errors=False,
+                 bulk_put_single_transaction=False):
 
         self._sql_alchemy_model = sql_alchemy_model
         virtual_table = self.virtual_table()
@@ -147,6 +148,7 @@ class ReadObject(object):
         self._list_column_objects = list_column_objects
         self._allow_bulk_update = allow_bulk_update
         self._extended_bulk_errors = extended_bulk_errors
+        self._bulk_put_single_transaction = bulk_put_single_transaction
 
     ###########################################################################
     # Overridable methods
