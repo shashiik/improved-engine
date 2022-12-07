@@ -123,7 +123,8 @@ class ReadObject(object):
                  column_objects=None,
                  list_column_objects=None,
                  allow_bulk_update=False,
-                 extended_bulk_errors=False):
+                 extended_bulk_errors=False,
+                 bulk_put_single_transaction=False):
 
         self._sql_alchemy_model = sql_alchemy_model
         virtual_table = self.virtual_table()
@@ -147,6 +148,7 @@ class ReadObject(object):
         self._list_column_objects = list_column_objects
         self._allow_bulk_update = allow_bulk_update
         self._extended_bulk_errors = extended_bulk_errors
+        self._bulk_put_single_transaction = bulk_put_single_transaction
 
     ###########################################################################
     # Overridable methods
@@ -972,7 +974,6 @@ class CrudObject(ReadObject):
             for key, column in self.get_parent_keys(db_session, request_params).items():
                 if column.class_ is not self._sql_alchemy_model:
                     q = q.filter(column == request_params.arguments[key])
-
             for key, value in zip(self._parent_values.keys(), q.first()):
                 updated = True
                 setattr(db_record, key, value)
@@ -1106,6 +1107,32 @@ class CrudObject(ReadObject):
             self.clear_values_cached(db_session, request_params, raw_result)
             return True
 
+    def update_core_single_transaction(self, db_session, request_params, resource_id, resource_dict):
+        query = self.base_query(db_session, request_params)
+        query = self.add_filter(db_session, request_params, query)
+        query = self.filter_primary(db_session, request_params, query, resource_id)
+        raw_result = query.first()
+        if raw_result is None:
+            raise CrudResponsePlain("Not found", 404)
+        model = self.get_update_row(db_session, request_params, raw_result)
+        updated = self._update_columns(db_session, request_params, resource_dict, model, False)
+        if updated:
+            self.on_update(db_session, request_params, resource_dict, model)
+            db_session.add(model)
+            db_session.flush()
+        up2 = self._update_columns_extra(db_session, request_params, resource_dict, model, False)
+        self.retainlock(db_session, request_params, resource_dict, model)
+        if updated or up2:
+            self.after_update(db_session, request_params, resource_dict, model)
+            self.clear_values_cached(db_session, request_params, raw_result)
+            return True
+
+    def do_finally(self, db_session, request_params, resource_id, resource_dict):
+        '''
+        This method is to be executed after the database commit on a single transaction bulk put.
+        '''
+        pass
+
     def update(self, db_engine, request_params, resource_id, resource_dict):
         """
         This method  it the main top level method that is called when a record is
@@ -1160,6 +1187,27 @@ class CrudObject(ReadObject):
         except (SQLAlchemyError) as e:
             return CrudResponsePlain(str(e), 400)
 
+    def delete_single_transaction(self, db_engine, request_params, resource_id):
+        try:
+            with session_scope(db_engine) as session:
+                self.init(session, request_params)
+                if not self.is_valid_del(session, request_params, resource_id):
+                    raise CrudResponsePlain("Invalid Delete", 400)
+                query = self.base_query(session, request_params)
+                query = self.add_filter(session, request_params, query)
+                query = self.filter_primary(session, request_params, query, resource_id)
+                raw_result = query.first()
+                if raw_result is None:
+                    raise CrudResponsePlain("Not found", 404)
+                model = self.get_update_row(session, request_params, raw_result)
+                self.on_delete(session, request_params, model)
+                self.perform_delete(session, request_params, model)
+                session.flush()
+                self.after_delete(session, request_params, model)
+            return CrudResponsePlain("Deleted resource {}".format(resource_id, 200))
+        except (SQLAlchemyError) as e:
+            return CrudResponsePlain(str(e), 400)
+
     def put(self, db_engine, request_params, resource_dict):
         """
         This method  it the main top level method that is called when a bulk put is
@@ -1203,6 +1251,39 @@ class CrudObject(ReadObject):
         except SQLAlchemyError as e:
             logging.error(str(e))
             return CrudResponsePlain("Error in bulk update", 400)
+
+    def put_single_transaction(self, db_engine, request_params, resource_dict):
+        if not self._allow_bulk_update:
+            raise CrudResponsePlain("Bulk Update not permitted", 405)
+        try:
+            response = []
+
+            if not isinstance(resource_dict, list):
+                resource_dict = [resource_dict]
+            with session_scope(db_engine) as session:
+                for row in resource_dict:
+                    try:
+                        if row.get('delete') == True:
+                            resp = self.delete_single_transaction(db_engine, request_params,
+                                                                  row[self._primary_key.name])
+                        else:
+                            updated = self.update_core_single_transaction(session, request_params,
+                                                                          row[self._primary_key.name], row)
+                    except CrudResponseException as e:
+                        response.append(dict(code=e.getStatusCode(), body=e.getBody(), data=row))
+                    except Exception as e:
+                        response.append(dict(code=400, body=str(e), data=row))
+                session.commit()
+                self.do_finally(session, request_params, row[self._primary_key.name], resource_dict)
+                for row in resource_dict:
+                    resp = self.get_one(db_engine, request_params, row[self._primary_key.name])
+                    if isinstance(resp, CrudResponseJson):
+                        response.append(dict(code=200, body=resp.json))
+                    else:
+                        response.append(dict(code=200, body=resp.getBody()))
+            return CrudResponseJson(response, 200)
+        except (SQLAlchemyError) as e:
+            return CrudResponsePlain(str(e), 400)
 
     ###########################################################################
     # Lock methods.
